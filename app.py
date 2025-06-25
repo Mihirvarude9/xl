@@ -1,85 +1,84 @@
+# app_xl.py  –  run with:
+#   uvicorn app_xl:app --host 0.0.0.0 --port 7866 --workers 1
 
+import os
+from uuid import uuid4
 
+import torch
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from uuid import uuid4
-from diffusers import BitsAndBytesConfig, SD3Transformer2DModel, StableDiffusion3Pipeline
-import torch
-import os
+from diffusers import StableDiffusionXLPipeline
 
-# === CONFIG ===
-model_id = "stabilityai/stable-diffusion-xl-base-1.0"
-API_KEY = "wildmind_5879fcd4a8b94743b3a7c8c1a1b4"
+# ───────────────────────── CONFIG ──────────────────────────
+MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
+API_KEY  = "wildmind_5879fcd4a8b94743b3a7c8c1a1b4"
 
-# Absolute path for consistent behavior
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "generated")
+BASE_DIR   = os.path.dirname(__file__)
+OUTPUT_DIR = os.path.join(BASE_DIR, "generated_xl")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# === LOAD MODEL (Stable Medium with NF4 Quantization) ===
-nf4_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16
-)
-
-model_nf4 = SD3Transformer2DModel.from_pretrained(
-    model_id,
-    subfolder="transformer",
-    quantization_config=nf4_config,
+# ──────────────────────── LOAD MODEL ───────────────────────
+print("🔄 Loading SDXL …")
+pipe = StableDiffusionXLPipeline.from_pretrained(
+    MODEL_ID,
     torch_dtype=torch.float16
-)
+).to("cuda")
+pipe.enable_model_cpu_offload()          # keeps VRAM low
+print("✅ SDXL ready!")
 
-pipeline = StableDiffusion3Pipeline.from_pretrained(
-    model_id,
-    transformer=model_nf4,
-    torch_dtype=torch.float16
-)
-pipeline.enable_model_cpu_offload()
-
-# === FASTAPI SETUP ===
+# ───────────────────────── FASTAPI ─────────────────────────
 app = FastAPI()
 
-# Allow frontend CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.wildmindai.com"],
+    allow_origins=[
+        "https://www.wildmindai.com",
+        "https://api.wildmindai.com",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["POST", "OPTIONS"],
+    allow_headers=["Content-Type", "x-api-key", "Accept"],
 )
 
-# ✅ Serve static images at /medium/images
+# serve at  https://api.wildmindai.com/xl/images/<file>.png
 app.mount("/xl/images", StaticFiles(directory=OUTPUT_DIR), name="xl-images")
 
-# === Request Schema ===
 class PromptRequest(BaseModel):
     prompt: str
+    steps: int = 60
+    guidance: float = 5.5
+    height: int = 1024      # SDXL defaults
+    width:  int = 1024
 
-# === /xl endpoint ===
 @app.post("/xl")
 async def generate_xl(request: Request, body: PromptRequest):
-    api_key = request.headers.get("x-api-key")
-    if api_key != API_KEY:
+    if request.headers.get("x-api-key") != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     prompt = body.prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt is empty")
 
-    image = pipeline(
-        prompt=prompt,
-        num_inference_steps=60,
-        guidance_scale=5.5,
+    img = pipe(
+        prompt            = prompt,
+        height            = body.height,
+        width             = body.width,
+        num_inference_steps = body.steps,
+        guidance_scale    = body.guidance
     ).images[0]
 
-    filename = f"{uuid4().hex}.png"
-    filepath = os.path.join(OUTPUT_DIR, filename)
-    image.save(filepath)
+    fname = f"{uuid4().hex}.png"
+    fpath = os.path.join(OUTPUT_DIR, fname)
+    img.save(fpath)
+    print("🖼️  saved", fpath)
 
-    print("✅ Saved image:", filepath)
+    return JSONResponse(
+        {"image_url": f"https://api.wildmindai.com/xl/images/{fname}"}
+    )
 
-    # ✅ Return image URL that matches mounted path
-    return {"image_url": f"https://api.wildmindai.com/xl/images/{filename}"}
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": "SDXL-base-1.0"}
